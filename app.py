@@ -1,6 +1,6 @@
 import os
 import re
-import json
+import base64
 import ipaddress
 import socket
 from html import escape
@@ -13,7 +13,6 @@ from flask import Flask, Response, redirect, request, stream_with_context
 app = Flask(__name__)
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 MAX_BYTES = 5 * 1024 * 1024
-BRAVE_KEY = os.environ.get("BRAVE_API_KEY", "")  # optional, most reliable search
 
 
 @app.after_request
@@ -177,17 +176,35 @@ def blank():
     return Response(html, headers={"Cache-Control": "no-store"})
 
 
-# ---------- /s : search ----------
-def results_brave(q):
-    _, body, _ = fetch(
-        "https://api.search.brave.com/res/v1/web/search?q=" + quote(q) + "&count=15",
-        headers={"X-Subscription-Token": BRAVE_KEY, "Accept": "application/json"},
-    )
-    items = json.loads(body).get("web", {}).get("results", [])
+# ---------- /s : search (tries several engines until one works) ----------
+def _ddg_href(href):
+    link = urlparse(urljoin("https://duckduckgo.com", href))
+    return parse_qs(link.query).get("uddg", [link.geturl()])[0]
+
+
+def results_bing(q):
+    def real(href):
+        p = urlparse(href)
+        if (p.hostname or "").endswith("bing.com") and p.path.startswith("/ck/"):
+            u = parse_qs(p.query).get("u", [""])[0]
+            if u.startswith("a1"):
+                try:
+                    b = u[2:]
+                    b += "=" * (-len(b) % 4)
+                    return base64.urlsafe_b64decode(b).decode()
+                except Exception:
+                    pass
+        return href
+
+    _, body, _ = fetch("https://www.bing.com/search?q=" + quote(q) + "&setlang=en&cc=us")
+    soup = BeautifulSoup(body, "html.parser")
     out = []
-    for it in items:
-        desc = BeautifulSoup(it.get("description", ""), "html.parser").get_text()
-        out.append((it.get("title", it["url"]), it["url"], desc))
+    for li in soup.select("li.b_algo"):
+        a = li.select_one("h2 a")
+        if not a or not a.get("href"):
+            continue
+        sn = li.select_one(".b_caption p") or li.select_one("p")
+        out.append((a.get_text().strip(), real(a["href"]), sn.get_text().strip() if sn else ""))
     return out
 
 
@@ -199,13 +216,47 @@ def results_ddg(q):
         a = el.select_one("a.result__a")
         if not a or not a.get("href"):
             continue
-        link = urlparse(urljoin("https://duckduckgo.com", a["href"]))
-        href = parse_qs(link.query).get("uddg", [link.geturl()])[0]
+        href = _ddg_href(a["href"])
         if (urlparse(href).hostname or "").endswith("duckduckgo.com"):
             continue
         sn = el.select_one(".result__snippet")
         out.append((a.get_text().strip(), href, sn.get_text().strip() if sn else ""))
     return out
+
+
+def results_ddg_lite(q):
+    _, body, _ = fetch("https://lite.duckduckgo.com/lite/", "POST", {"q": q})
+    soup = BeautifulSoup(body, "html.parser")
+    out = []
+    for a in soup.select("a.result-link"):
+        href = _ddg_href(a.get("href", ""))
+        if (urlparse(href).hostname or "").endswith("duckduckgo.com"):
+            continue
+        sn = ""
+        tr = a.find_parent("tr")
+        nxt = tr.find_next_sibling("tr") if tr else None
+        s = nxt.select_one(".result-snippet") if nxt else None
+        if s:
+            sn = s.get_text().strip()
+        out.append((a.get_text().strip(), href, sn))
+    return out
+
+
+def results_mojeek(q):
+    _, body, _ = fetch("https://www.mojeek.com/search?q=" + quote(q))
+    soup = BeautifulSoup(body, "html.parser")
+    out = []
+    for li in soup.select("ul.results-standard > li"):
+        a = li.select_one("a.title") or li.select_one("h2 a")
+        if not a or not a.get("href"):
+            continue
+        sn = li.select_one("p.s")
+        out.append((a.get_text().strip(), a["href"], sn.get_text().strip() if sn else ""))
+    return out
+
+
+ENGINES = [("Bing", results_bing), ("DuckDuckGo", results_ddg),
+           ("DuckDuckGo Lite", results_ddg_lite), ("Mojeek", results_mojeek)]
 
 
 @app.route("/s", methods=["GET", "POST"])
@@ -215,18 +266,24 @@ def search():
         return redirect("/blank")
     if re.match(r"^https?://", q, re.I) or re.match(r"^[\w-]+(\.[\w-]+)+(/\S*)?$", q):
         return redirect(prox(q if q.lower().startswith("http") else "https://" + q))
-    try:
-        results = results_brave(q) if BRAVE_KEY else results_ddg(q)
-        out = ""
-        for title, href, snippet in results:
-            out += ('<div class="res"><a href="%s">%s</a><small>%s</small><p>%s</p></div>'
-                    % (escape(prox(href)), escape(title), escape(href), escape(snippet)))
-        if not out:
-            out = ('<p class="hint">No results found. If this keeps happening, the search engine may be '
-                   'blocking this server. Set a BRAVE_API_KEY environment variable to fix it.</p>')
-        return Response(page("Results", out), headers={"Cache-Control": "no-store"})
-    except Exception as e:
-        return Response(page("Error", '<div class="err">Search failed: %s</div>' % escape(str(e))), 502)
+    results, errs = [], []
+    for name, fn in ENGINES:
+        try:
+            results = fn(q)
+            if results:
+                break
+            errs.append(name + ": no results (probably blocked)")
+        except Exception as e:
+            errs.append("%s: %s" % (name, e))
+    if not results:
+        msg = ('<div class="err">No results. Every search engine failed:<br>%s</div>'
+               % "<br>".join(escape(x) for x in errs))
+        return Response(page("Results", msg), headers={"Cache-Control": "no-store"})
+    out = ""
+    for title, href, snippet in results:
+        out += ('<div class="res"><a href="%s">%s</a><small>%s</small><p>%s</p></div>'
+                % (escape(prox(href)), escape(title), escape(href), escape(snippet)))
+    return Response(page("Results", out), headers={"Cache-Control": "no-store"})
 
 
 # ---------- /p : proxied page ----------
