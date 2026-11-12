@@ -139,11 +139,25 @@ body{display:flex;flex-direction:column;font:16px system-ui,sans-serif}
 iframe{flex:1;width:100%;border:0;background:#fff}
 </style></head><body>
 <div class="bar"><a href="/" onclick="location.replace('/');return false">Exit</a>
-<form action="/s" method="post" target="view" autocomplete="off"
-      onsubmit="var f=this;setTimeout(function(){f.q.value='';f.q.focus()},50)">
-<input name="q" placeholder="Search privately or paste a link" autofocus>
+<form id="f" autocomplete="off">
+<input id="q" name="q" placeholder="Search privately or paste a link" autocomplete="off" autocapitalize="off" spellcheck="false" autofocus>
 <button>Go</button></form></div>
-<iframe name="view" src="/blank"></iframe>
+<iframe id="view" name="view" sandbox="allow-forms" srcdoc=""></iframe>
+<script>
+var f=document.getElementById('f'),q=document.getElementById('q'),v=document.getElementById('view');
+f.addEventListener('submit',function(e){
+  e.preventDefault();
+  var text=q.value.trim();
+  q.value='';
+  if(!text)return;
+  fetch('/s',{method:'POST',cache:'no-store',credentials:'omit',referrerPolicy:'no-referrer',
+              body:new URLSearchParams({q:text})})
+    .then(function(r){return r.text()})
+    .then(function(h){v.srcdoc=h})
+    .catch(function(){v.srcdoc='<p style="font:16px system-ui;padding:20px">Something went wrong.</p>'});
+});
+window.addEventListener('pageshow',function(){q.value='';v.srcdoc='';});
+</script>
 </body></html>"""
 
 
@@ -210,7 +224,7 @@ def search():
         if not out:
             out = ('<p class="hint">No results found. If this keeps happening, the search engine may be '
                    'blocking this server. Set a BRAVE_API_KEY environment variable to fix it.</p>')
-        return Response(page(q, out), headers={"Cache-Control": "no-store"})
+        return Response(page("Results", out), headers={"Cache-Control": "no-store"})
     except Exception as e:
         return Response(page("Error", '<div class="err">Search failed: %s</div>' % escape(str(e))), 502)
 
