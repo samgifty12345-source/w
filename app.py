@@ -141,7 +141,7 @@ iframe{flex:1;width:100%;border:0;background:#fff}
 <form id="f" autocomplete="off">
 <input id="q" name="q" placeholder="Search privately or paste a link" autocomplete="off" autocapitalize="off" spellcheck="false" autofocus>
 <button>Go</button></form></div>
-<iframe id="view" name="view" sandbox="allow-forms" srcdoc=""></iframe>
+<iframe id="view" name="view" sandbox="allow-forms allow-scripts allow-same-origin allow-presentation" allow="fullscreen" allowfullscreen srcdoc=""></iframe>
 <script>
 var f=document.getElementById('f'),q=document.getElementById('q'),v=document.getElementById('view');
 f.addEventListener('submit',function(e){
@@ -286,6 +286,31 @@ def search():
     return Response(page("Results", out), headers={"Cache-Control": "no-store"})
 
 
+def youtube_id(u):
+    p = urlparse(u)
+    h = (p.hostname or "").lower()
+    vid = None
+    if h == "youtu.be":
+        vid = p.path.strip("/").split("/")[0]
+    elif h == "youtube.com" or h.endswith(".youtube.com"):
+        if p.path == "/watch":
+            vid = parse_qs(p.query).get("v", [""])[0]
+        else:
+            m = re.match(r"^/(shorts|embed|live)/([\w-]+)", p.path)
+            vid = m.group(2) if m else None
+    return vid if vid and re.match(r"^[\w-]{6,20}$", vid) else None
+
+
+def youtube_page(vid):
+    body = ('<iframe src="https://www.youtube-nocookie.com/embed/%s?rel=0&playsinline=1" '
+            'style="width:100%%;aspect-ratio:16/9;border:0;border-radius:8px;background:#000" '
+            'allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen '
+            'referrerpolicy="strict-origin-when-cross-origin"></iframe>' % vid)
+    return Response(page("Video", body), headers={
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-src https://www.youtube-nocookie.com"})
+
+
 # ---------- /p : proxied page ----------
 @app.route("/p")
 def proxy():
@@ -295,6 +320,9 @@ def proxy():
             t = urlparse(request.args["__action"])
             params = {k: v for k, v in request.args.items() if k not in ("__action", "u")}
             target = t._replace(query=urlencode(params)).geturl()
+        vid = youtube_id(target)
+        if vid:
+            return youtube_page(vid)
         r, body, final = fetch(target)
         ctype = r.headers.get("content-type", "")
         if not any(x in ctype.lower() for x in ("text/html", "application/xhtml")):
